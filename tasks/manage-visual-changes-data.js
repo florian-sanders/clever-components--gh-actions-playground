@@ -3,7 +3,7 @@ import { CELLAR_HOST, CellarClient } from './cellar-client.js';
 import { getBranchBaseCommit, getCurrentBranch } from './git-utils.js';
 
 const CURRENT_BRANCH = getCurrentBranch();
-const BUCKET_NAME = 'clever-test-flo-visual-regressions';
+const BUCKET_NAME = 'visual-changes';
 const REMOTE_DIR = `${CURRENT_BRANCH}/test-reports`;
 const cellar = new CellarClient({
   bucket: BUCKET_NAME,
