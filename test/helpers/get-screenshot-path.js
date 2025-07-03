@@ -7,7 +7,7 @@ import { getCurrentBranch } from '../../tasks/git-utils.js';
  */
 
 const CURRENT_BRANCH_NAME = getCurrentBranch();
-export const BUCKET_NAME = 'clever-test-flo-visual-regressions';
+export const BUCKET_NAME = 'visual-changes';
 const BASE_SCREENSHOT_URL = new URL(`${CURRENT_BRANCH_NAME}`, `https://${BUCKET_NAME}.${CELLAR_HOST}`);
 const EXTENSION = '.png';
 
