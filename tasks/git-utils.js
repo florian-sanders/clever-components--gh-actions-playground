@@ -2,6 +2,10 @@ import { execSync } from 'child_process';
 import superagent from 'superagent';
 
 export function getCurrentBranch() {
+  // Use the GitHub Actions env var if available
+  if (process.env.GITHUB_HEAD_REF != null && process.env.GITHUB_HEAD_REF.length > 0) {
+    return process.env.GITHUB_HEAD_REF;
+  }
   const stdout = execSync('git branch --show-current');
   return stdout.toString().trim();
 }
@@ -13,6 +17,22 @@ export function getCurrentCommit() {
 
 export function getCurrentAuthor() {
   const stdout = execSync(`git log -1 --pretty=format:'%an'`);
+  return stdout.toString().trim();
+}
+
+/**
+ * Returns the base commit SHA between the given branch and master.
+ * If no branch is provided, uses the current branch.
+ *
+ * @param {string} [baseBranch]
+ * @param {string} [branchToCompare] - The name of the branch to compare with master (defaults to current branch).
+ * @return {string} The SHA of the base commit.
+ **/
+export function getBranchBaseCommit(baseBranch = 'master', branchToCompare) {
+  if (branchToCompare == null) {
+    branchToCompare = getCurrentBranch();
+  }
+  const stdout = execSync(`git merge-base ${baseBranch} ${branchToCompare}`);
   return stdout.toString().trim();
 }
 
