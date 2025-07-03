@@ -1,0 +1,272 @@
+name: Run visual changes Tests
+
+concurrency:
+  group: visual-changes-${{ github.event.pull_request.number || github.event.pull_request.head.ref }}
+  cancel-in-progress: true
+
+on:
+  pull_request:
+    types: [synchronize, opened, reopened, closed, labeled, unlabeled]
+
+jobs:
+  split-into-shards:
+    if: github.event.action != 'closed' && !contains(github.event.pull_request.labels.*.name, 'skip-visual-changes-tests')
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.set-matrix.outputs.matrix }}
+    steps:
+      - name: '[Prepare] Checkout'
+        uses: actions/checkout@v4
+
+      - name: '[Prepare] Setup Node.js'
+        uses: actions/setup-node@v4
+        with:
+          node-version-file: 'package.json'
+          cache: 'npm'
+      - run: npm ci
+
+      - id: set-matrix
+        run: |
+          echo "matrix=$(node ./tasks/get-number-of-visual-batches.js)" >> $GITHUB_OUTPUT
+
+  check-for-last-baseline-update:
+    if: github.event.action != 'closed' && !contains(github.event.pull_request.labels.*.name, 'skip-visual-changes-tests')
+    name: Check for last baseline update
+    runs-on: ubuntu-latest
+    outputs:
+      should_update_baseline: ${{ steps.check-for-last-baseline-update.outputs.should_update_baseline }}
+      last_baseline_update: ${{ steps.check-for-last-baseline-update.outputs.last_baseline_update }}
+    steps:
+      - name: '[Prepare] Checkout'
+        uses: actions/checkout@v4
+
+      - name: '[Prepare] Setup Node.js'
+        uses: actions/setup-node@v4
+        with:
+          node-version-file: 'package.json'
+          cache: 'npm'
+      - run: npm ci
+
+      - name: Check for last baseline update
+        id: check-for-last-baseline-update
+        run: node ./tasks/manage-visual-changes-data.js check-for-baseline-update
+        env:
+          VISUAL_REGRESSIONS_CELLAR_KEY_ID: ${{ secrets.VISUAL_REGRESSIONS_CELLAR_KEY_ID }}
+          VISUAL_REGRESSIONS_CELLAR_SECRET_KEY: ${{ secrets.VISUAL_REGRESSIONS_CELLAR_SECRET_KEY }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+
+  baseline-update:
+    if: needs.check-for-last-baseline-update.outputs.should_update_baseline == 'true' && !contains(github.event.pull_request.labels.*.name, 'skip-visual-changes-tests')
+    name: Baseline Update (sharded)
+    needs: [split-into-shards, check-for-last-baseline-update]
+    runs-on: ubuntu-latest
+    container:
+      image: mcr.microsoft.com/playwright:v1.53.2-noble
+      options: --user 1001
+    strategy:
+      matrix:
+        batch: ${{ fromJson(needs.split-into-shards.outputs.matrix) }}
+    steps:
+      - run: echo should_update_baseline=${{ needs.check-for-last-baseline-update.outputs.should_update_baseline }}
+      - name: '[Prepare] Checkout base commit'
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.base.sha }}
+
+      - name: '[Prepare] Setup Node.js'
+        uses: actions/setup-node@v4
+        with:
+          node-version-file: 'package.json'
+          cache: 'npm'
+
+      - name: '[Prepare] Install dependencies'
+        run: npm ci
+
+      - name: 'Run Visual Regression Tests (Baseline update) - batch ${{ matrix.batch }}'
+        run: npm run test-visual-regressions:update-baseline -- --group batch-${{ matrix.batch }}
+        env:
+          VISUAL_REGRESSIONS_CELLAR_KEY_ID: ${{ secrets.VISUAL_REGRESSIONS_CELLAR_KEY_ID }}
+          VISUAL_REGRESSIONS_CELLAR_SECRET_KEY: ${{ secrets.VISUAL_REGRESSIONS_CELLAR_SECRET_KEY }}
+          GITHUB_HEAD_REF: ${{ github.event.pull_request.head.ref }}
+
+      - name: 'Set LAST_BASELINE_UPDATE output'
+        id: set_last_baseline_update
+        run: |
+          echo "last_baseline_update=$(TZ=Europe/Paris date +'%Y-%m-%dT%H:%M:%SZ')" >> $GITHUB_OUTPUT
+
+    outputs:
+      last_baseline_update: ${{ steps.set_last_baseline_update.outputs.last_baseline_update }}
+
+  run-visual-regression-tests:
+    if: github.event.action.type != 'closed' && !contains(github.event.pull_request.labels.*.name, 'skip-visual-changes-tests') && !cancelled()
+    name: Run Visual Regression Tests (Current changes)
+    needs: [split-into-shards, check-for-last-baseline-update, baseline-update]
+    runs-on: ubuntu-latest
+    container:
+      image: mcr.microsoft.com/playwright:v1.53.2-noble
+      options: --user 1001
+    strategy:
+      matrix:
+        batch: ${{ fromJson(needs.split-into-shards.outputs.matrix) }}
+    steps:
+      - name: '[Prepare] Checkout latest commit'
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.ref }}
+
+      - name: '[Prepare] Setup Node.js'
+        uses: actions/setup-node@v4
+        with:
+          node-version-file: 'package.json'
+          cache: 'npm'
+      - run: npm ci
+
+      - name: Run Visual Regression Tests (Current changes) - batch ${{ matrix.batch }}'
+        run: npm run test-visual-regressions -- --group batch-${{ matrix.batch }}
+        env:
+          VISUAL_REGRESSIONS_CELLAR_KEY_ID: ${{ secrets.VISUAL_REGRESSIONS_CELLAR_KEY_ID }}
+          VISUAL_REGRESSIONS_CELLAR_SECRET_KEY: ${{ secrets.VISUAL_REGRESSIONS_CELLAR_SECRET_KEY }}
+          GITHUB_HEAD_REF: ${{ github.event.pull_request.head.ref }}
+        continue-on-error: true
+
+      - name: '[Prepare] Get report update date'
+        id: set-last-changes-update
+        run: echo "last_changes_update=$(TZ=Europe/Paris date +'%Y-%m-%dT%H:%M:%SZ')" >> $GITHUB_OUTPUT
+
+      - name: Upload report to GitHub Actions Artifacts
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: visual-regression-results-${{ matrix.batch }}.json
+          path: test-reports/visual-regression-results.json
+          retention-days: 1
+
+    outputs:
+      last_changes_update: ${{ steps.set-last-changes-update.outputs.last_changes_update }}
+
+  generate-final-report:
+    if: github.event.action != 'closed' && !contains(github.event.pull_request.labels.*.name, 'skip-visual-changes-tests') && !cancelled()
+    name: Generate final report
+    needs: [check-for-last-baseline-update, baseline-update, run-visual-regression-tests]
+    runs-on: ubuntu-latest
+    steps:
+      - name: '[Prepare] Checkout latest commit'
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.ref }}
+
+      - name: '[Prepare] Setup Node.js'
+        uses: actions/setup-node@v4
+        with:
+          node-version-file: 'package.json'
+          cache: 'npm'
+      - run: npm ci
+
+      - name: Download reports from GitHub Actions Artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: test-reports
+          pattern: visual-regression-results-*
+
+      - name: Generate single HTML report
+        run: node ./tasks/generate-visual-regression-html-report.js
+        env:
+          GITHUB_HEAD_REF: ${{ github.head_ref }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          LAST_BASELINE_UPDATE: ${{ needs.baseline-update.outputs.last_baseline_update || needs.check-for-last-baseline-update.outputs.last_baseline_update }}
+          LAST_CHANGES_UPDATE: ${{ needs.run-visual-regression-tests.outputs.last_changes_update }}
+          WORKFLOW_ID: ${{ github.run_id }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+
+      - name: 'Upload test report'
+        id: 'upload-test-report'
+        run: node ./tasks/manage-visual-changes-data.js upload
+        env:
+          VISUAL_REGRESSIONS_CELLAR_KEY_ID: ${{ secrets.VISUAL_REGRESSIONS_CELLAR_KEY_ID }}
+          VISUAL_REGRESSIONS_CELLAR_SECRET_KEY: ${{ secrets.VISUAL_REGRESSIONS_CELLAR_SECRET_KEY }}
+          GITHUB_HEAD_REF: ${{ github.head_ref }}
+
+      - name: '[Prepare] Retrieve and format impacted components list'
+        id: get-impacted-components-list
+        run: |
+          impacted_components=$(jq -r '.impactedComponents[] | "- \(. )"' test-reports/visual-regression-results-merged.json | paste -sd '\n' -)
+          echo "impacted_components<<EOF" >> $GITHUB_OUTPUT
+          echo "$impacted_components" >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+          echo nb_of_impacted_components=$(jq '.impactedComponents | length' test-reports/visual-regression-results-merged.json) >> $GITHUB_OUTPUT
+
+      - name: 'Create or edit PR comment'
+        run: node .github/scripts/create-or-edit-comment.js
+        env:
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          MARKER: 'Visual Changes Report'
+          MESSAGE: |
+            ## :monocle_face: Visual Changes Report for PR #${{ github.event.pull_request.number }}
+
+            The latest visual regression test report is available. Please review the results.
+
+            - <a href="${{ steps.upload-test-report.outputs.report_url }}" rel="noopener" target="_blank" title="View HTML Report - new window">View HTML Report</a>
+            - Baseline info:
+              - Commit: ${{ github.event.pull_request.base.sha }}
+              - Last update: ${{ needs.baseline-update.outputs.last_baseline_update || needs.check-for-last-baseline-update.outputs.last_baseline_update }}
+            - Changes info:
+              - Commit: ${{ github.event.pull_request.head.sha }}
+              - Last update: ${{ needs.run-visual-regression-tests.outputs.last_changes_update }}
+            - Workflow run: [${{ github.run_id }}](https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }})
+
+            <details>
+              <summary>${{ steps.get-impacted-components-list.outputs.nb_of_impacted_components }} components impacted</summary>
+
+            ${{ steps.get-impacted-components-list.outputs.impacted_components }}
+
+            </details>
+
+            _This comment was generated automatically by the Visual Changes workflow._
+
+  clean-up:
+    if: github.event.action == 'closed' || contains(github.event.pull_request.labels.*.name, 'skip-visual-changes-tests')
+    name: 'Clean up visual changes report data'
+    runs-on: ubuntu-latest
+    steps:
+      - name: '[Prepare] Checkout'
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.ref }}
+
+      - name: '[Prepare] Setup Node.js'
+        uses: actions/setup-node@v4
+        with:
+          node-version-file: 'package.json'
+          cache: 'npm'
+      - run: npm ci
+
+      - name: '[Run] Remove report data for current branch'
+        id: delete-report-and-assets
+        run: node ./tasks/manage-visual-changes-data.js delete
+        env:
+          VISUAL_REGRESSIONS_CELLAR_KEY_ID: ${{ secrets.VISUAL_REGRESSIONS_CELLAR_KEY_ID }}
+          VISUAL_REGRESSIONS_CELLAR_SECRET_KEY: ${{ secrets.VISUAL_REGRESSIONS_CELLAR_SECRET_KEY }}
+          GITHUB_HEAD_REF: ${{ github.head_ref }}
+
+      - name: '[Run] Create clean up comment'
+        if: (!contains(github.event.pull_request.labels.*.name, 'skip-visual-changes-tests'))
+        run: node .github/scripts/create-or-edit-comment.js
+        env:
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          MESSAGE: |
+            ## :broom: Visual Changes Report deleted
+
+            The report and its associated data have been deleted following the closing of this PR.
+
+            _This comment was generated automatically by the Visual Changes workflow._
+
+      - name: '[Run] Delete report comment'
+        if: (contains(github.event.pull_request.labels.*.name, 'skip-visual-changes-tests'))
+        run: node .github/scripts/delete-comment.js
+        env:
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          MARKER: 'Visual Changes Report'

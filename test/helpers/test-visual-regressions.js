@@ -2,8 +2,10 @@ import {
   ignoreWindowOnError,
   isResizeObserverLoopErrorMessage,
 } from '@lit-labs/virtualizer/support/resize-observer-errors.js';
-import { elementUpdated, expect, fixture } from '@open-wc/testing';
+import { elementUpdated, fixture } from '@open-wc/testing';
 import { setViewport } from '@web/test-runner-commands';
+import { visualDiff } from '@web/test-runner-visual-regression';
+import { kebabCase } from '../../src/lib/change-case.js';
 import { addTranslations } from '../../src/lib/i18n/i18n.js';
 import * as en from '../../src/translations/translations.en.js';
 
@@ -15,8 +17,6 @@ import * as en from '../../src/translations/translations.en.js';
  * @typedef {import('@storybook/web-components').WebComponentsRenderer} WebComponentsRenderer
  * @typedef {import('@storybook/web-components').StoryContext<WebComponentsRenderer>} StoryContext
  */
-
-// TODO Flo: mock Date?
 
 const viewports = {
   desktop: {
@@ -59,20 +59,6 @@ function setupIgnoreIrrelevantErrors(before, after, messagePredicate) {
   });
 }
 
-async function preloadImages(imagesToPreload) {
-  const preloadPromises = imagesToPreload.map((src) => {
-    return new Promise((resolve, reject) => {
-      const img = new Image();
-      img.onload = () => resolve(`loaded ${src}`);
-      img.onerror = () => reject(`failed to load ${src}`);
-      img.fetchPriority = 'high';
-      img.src = src;
-    });
-  });
-
-  await Promise.all(preloadPromises);
-}
-
 setupIgnoreIrrelevantErrors(before, after, (message) => {
   return (
     isResizeObserverLoopErrorMessage(message) ||
@@ -82,31 +68,74 @@ setupIgnoreIrrelevantErrors(before, after, (message) => {
   );
 });
 
-const IGNORE_PATTERNS_FOR_VISUAL_REGRESSIONS = ['waiting', 'loading', 'simulation', 'skeleton'];
+const OriginalDate = Date;
+beforeEach(async () => {
+  // await executeServerCommand('install-clock');
+  Date = class MockedDate extends OriginalDate {
+    constructor() {
+      super();
+
+      return new OriginalDate('2024-02-02T10:00:00');
+    }
+
+    static now() {
+      return new OriginalDate('2024-02-02T10:00:00');
+    }
+
+    getTime() {
+      return new OriginalDate('2024-02-02T10:00:00').getTime();
+    }
+  };
+});
+// beforeEach(async () => {
+//   await executeServerCommand('pause-clock');
+// });
+afterEach(async () => {
+  // await executeServerCommand('resume-clock');
+  Date = OriginalDate;
+});
+
+const IGNORE_PATTERNS_FOR_VISUAL_REGRESSIONS = ['simulation'];
 
 /**
- * Recursively injects a <style> tag with the given CSS into all shadow roots in the subtree.
- * @param {Node} root - The root node to start searching from (usually document.body)
- * @param {string} css - The CSS string to inject
+ * Recursively cancels all running animations in the subtree (including shadow roots),
+ * and optionally injects a <style> tag with the given CSS into all shadow roots.
+ * @param {Element|DocumentFragment} root - The root node to start searching from (usually document.body)
  */
-export function injectCssIntoAllShadowRoots(root, css) {
-  if (root.shadowRoot) {
-    const style = document.createElement('style');
-    style.textContent = css;
-    root.shadowRoot.appendChild(style);
-  }
-  // Traverse children (for both shadow and light DOM)
-  if (root.children.length > 0) {
-    Array.from(root.children).forEach((child) => injectCssIntoAllShadowRoots(child, css));
+export function cancelAnimations(root) {
+  // if (root.shadowRoot != null && root.shadowRoot.querySelector('#cancel-animations') == null) {
+  //   const styleElement = document.createElement('style');
+  //   styleElement.id = 'cancel-animations';
+  //   styleElement.textContent = DISABLE_ANIMATIONS_CSS;
+  //   root.shadowRoot.prepend(styleElement);
+  // }
+  // Cancel all running animations on this node
+  if (typeof root.getAnimations === 'function') {
+    for (const anim of root.getAnimations()) {
+      try {
+        anim.pause();
+        anim.currentTime = 0;
+      } catch {
+        /* ignore */
+      }
+    }
   }
 
-  if (root.shadowRoot != null && root.shadowRoot.children.length > 0) {
-    Array.from(root.shadowRoot.children).forEach((child) => injectCssIntoAllShadowRoots(child, css));
+  // Traverse shadow root if present
+  if (root instanceof Element && root.shadowRoot) {
+    cancelAnimations(root.shadowRoot);
+  }
+
+  // Traverse children (for both light DOM and shadow DOM)
+  if (root instanceof Element || root instanceof DocumentFragment) {
+    for (const child of root.children ? Array.from(root.children) : []) {
+      cancelAnimations(child);
+    }
   }
 }
 
 const DISABLE_ANIMATIONS_CSS = `
-  *, *::before, *::after {
+  *, *::before, *::after, .skeleton {
     transition: none !important;
     animation: none !important;
     animation-duration: 0s !important;
@@ -162,6 +191,47 @@ const getDefaultTestsConfig = (storyName) => ({
   },
 });
 
+export async function waitForAllImagesLoaded(root, timeoutMs = 5000) {
+  /**
+   * Recursively collects all <img> elements from the given root, including shadow roots.
+   * @param {Element|DocumentFragment} node
+   * @returns {HTMLImageElement[]}
+   */
+  function collectAllImages(node) {
+    let images = [];
+    if (node instanceof Element || node instanceof DocumentFragment) {
+      // Collect images in the light DOM
+      images.push(...node.querySelectorAll('img[src]'));
+      // Traverse shadow root if present
+      if (node.shadowRoot) {
+        images.push(...collectAllImages(node.shadowRoot));
+      }
+      // Traverse children (for slot or DocumentFragment)
+      for (const child of node.children || []) {
+        images.push(...collectAllImages(child));
+      }
+    }
+    return images;
+  }
+
+  const allImages = collectAllImages(root);
+
+  const imagePromises = allImages.map((img) =>
+    img.complete && img.naturalWidth > 0
+      ? Promise.resolve()
+      : new Promise((resolve) => {
+          img.addEventListener('load', resolve, { once: true });
+          img.addEventListener('error', resolve, { once: true });
+        }),
+  );
+
+  // Add a timeout to the whole operation
+  await Promise.race([
+    Promise.all(imagePromises),
+    new Promise((_, reject) => setTimeout(() => reject(new Error('Timeout waiting for images to load')), timeoutMs)),
+  ]);
+}
+
 /** @param {RawStoriesModule} storiesModule */
 export async function testStories(storiesModule) {
   const componentTag = storiesModule.default.component;
@@ -172,41 +242,51 @@ export async function testStories(storiesModule) {
   );
 
   if (shouldRunTests) {
-    describe(`Component: ${componentTag}`, function () {
+    describe(componentTag, function () {
       stories.forEach(({ storyName, storyFunction }) => {
         if (
           storyFunction.parameters.tests.accessibility.enable ||
           storyFunction.parameters.tests.visualRegressions.enable
         ) {
-          describe(`Story: ${storyName}`, function () {
-            describe(`Desktop: width = ${viewports.desktop.width} height = ${viewports.desktop.height}`, async function () {
-              if (storyFunction.parameters.tests.accessibility.enable) {
-                it('should be accessible', async function () {
+          describe(storyName, function () {
+            const storyNameWithKebabCase = kebabCase(storyName);
+            describe(`desktop`, async function () {
+              if (storyFunction.parameters.tests.visualRegressions.enable) {
+                it('should have no visual regression', async function () {
                   await setViewport(viewports.desktop);
-                  await document.fonts.ready;
                   const element = await fixture(storyFunction({}, storyConf));
 
+                  element.classList.add('no-animations');
                   await elementUpdated(element);
 
-                  await expect(element).to.be.accessible({
-                    ignoredRules: storyFunction.parameters.tests.accessibility.ignoredRules,
-                  });
+                  try {
+                    await waitForAllImagesLoaded(element);
+                  } catch {
+                    console.warn('Some images failed to load in time');
+                  }
+                  cancelAnimations(element);
+                  await visualDiff(element, `${componentTag}-${storyNameWithKebabCase}-desktop`);
                 });
               }
             });
 
-            describe(`Mobile: width = ${viewports.mobile.width} height = ${viewports.mobile.height}`, async function () {
-              if (storyFunction.parameters.tests.accessibility.enable) {
-                it('should be accessible', async function () {
+            describe('mobile', async function () {
+              if (storyFunction.parameters.tests.visualRegressions.enable) {
+                it('should have no visual regression', async function () {
                   await setViewport(viewports.mobile);
-                  await document.fonts.ready;
                   const element = await fixture(storyFunction({}, storyConf));
 
-                  await elementUpdated(element.shadowRoot.querySelector(`${componentTag}`));
+                  element.classList.add('no-animations');
+                  await elementUpdated(element);
 
-                  await expect(element).to.be.accessible({
-                    ignoredRules: storyFunction.parameters.tests.accessibility.ignoredRules,
-                  });
+                  cancelAnimations(element);
+                  try {
+                    await waitForAllImagesLoaded(element);
+                  } catch {
+                    console.warn('Some images failed to load in time');
+                  }
+
+                  await visualDiff(element, `${componentTag}-${storyNameWithKebabCase}-mobile`);
                 });
               }
             });
