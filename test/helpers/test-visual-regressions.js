@@ -68,8 +68,10 @@ setupIgnoreIrrelevantErrors(before, after, (message) => {
   );
 });
 
+const OriginalMath = Math;
 const OriginalDate = Date;
 beforeEach(async () => {
+  Math.random = () => 0.5;
   // await executeServerCommand('install-clock');
   Date = class MockedDate extends OriginalDate {
     constructor() {
